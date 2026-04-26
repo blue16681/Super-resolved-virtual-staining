@@ -109,8 +109,8 @@ def create_argparser():
         microbatch=-1, # microbatch size
         ema_rate="0.9999", 
         log_interval=10,
-        save_interval=2000,
-        val_interval=1000,
+        save_interval=20, #2000
+        val_interval=10,  #1000
         resume_checkpoint="",
         model_dir="models",
         log_dir="log",

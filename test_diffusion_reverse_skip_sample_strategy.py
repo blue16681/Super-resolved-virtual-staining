@@ -86,7 +86,9 @@ def main(args=None):
         all_outputs, all_folder, all_files, all_targets = [], [], [], []
         n_sample = 0
         while len(all_outputs) * args.batch_size < args.num_samples:
+            print("before next(data)")
             batch, cond, gt, model_kwargs, filename, folder = next(data)
+            print("after next(data)")
             all_targets.append(batch.permute(0, 2, 3, 1).cpu().numpy())
 
             cond = cond.to(dist_util.dev())
@@ -169,16 +171,16 @@ def load_pair_superres_data(hr_data_dir, lr_data_dir, batch_size, large_size, sm
 
 def create_argparser(avg_steps=0):
     defaults = dict(
-        lr_data_dir="./test_samples/input",
-        hr_data_dir="./test_samples/target",
+        lr_data_dir="dataset/BCI/train/HE",
+        hr_data_dir="dataset/BCI/train/IHC",# 仅用作评估，推理时不使用
         schedule_sampler="uniform",
-        cond_channels = 4,
+        cond_channels = 3,
         out_channels = 3,
         num_samples = 1,
         lr=1e-4,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        batch_size=2,
+        batch_size=1,
         microbatch=-1,
         ema_rate="0.9999",
         clip_denoised=False,
@@ -189,8 +191,8 @@ def create_argparser(avg_steps=0):
         timestep_respacing=[1000],
         avg_steps=avg_steps,
         model_dir="models",
-        model_name="BBDM-20240425-1500",
-        ckpt="ema_0.9999_220000_compress.pt",
+        model_name="BBDM-20260426-1256",
+        ckpt="ema_0.9999_000020_compress.pt",
         log_dir="log",
         save_dir="outputs_5x_skip",
         use_fp16=False,

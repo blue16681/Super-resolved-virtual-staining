@@ -1,5 +1,6 @@
 dataset/
 log/
+models/
 
 __pycache__/
 *.pyc

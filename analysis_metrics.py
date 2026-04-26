@@ -138,3 +138,4 @@ if __name__ == "__main__":
             print(f"Warning: Mismatch in GT and model paths for {model_name}")
             continue
         compute_metrics_for_model(paths, path_gt, model_name, output_dir)
+    #整体逻辑为，首先定义了一个函数evaluate_images，用于计算PSNR和SSIM指标。然后定义了一个函数extract_slide_fov_names，用于从文件路径中提取slide name和FOV name。接着定义了一个函数compute_metrics_for_model，用于计算每个模型的PSNR、SSIM和LPIPS指标，并将结果保存到CSV文件中。最后，在主函数中，使用glob库获取所有模型的输出路径和GT路径，并调用compute_metrics_for_model函数计算指标并保存结果。
