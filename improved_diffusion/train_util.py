@@ -1,6 +1,8 @@
 import copy
+import csv
 import functools
 import os
+from datetime import datetime
 
 import blobfile as bf
 import numpy as np
@@ -13,6 +15,12 @@ import time
 
 import matplotlib.pyplot as plt
 plt.ion()
+from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from skimage.metrics import structural_similarity as compare_ssim
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 from . import dist_util, logger
 from .fp16_util import (
@@ -40,6 +48,7 @@ class TrainLoop:
         model_compressor,
         diffusion,
         data,
+        val_data=None,
         batch_size,
         microbatch,
         lr,
@@ -55,11 +64,15 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        val_num_samples=0,
+        val_metrics_csv="val_metrics.csv",
+        val_disable_lpips=False,
     ):
         self.model = model
         self.model_compression = model_compressor
         self.diffusion = diffusion
         self.data = data
+        self.val_data = val_data
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
@@ -81,6 +94,10 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+        self.val_num_samples = val_num_samples
+        self.val_metrics_csv = os.path.join(self.log_dir, val_metrics_csv)
+        self.val_disable_lpips = val_disable_lpips
+        self.val_lpips = None
 
         self.step = 0
         self.resume_step = 0
@@ -187,8 +204,11 @@ class TrainLoop:
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()
             if self.step % self.val_interval == 0 and self.step > 0:
-                batch, cond, kwargs = next(self.data)
-                self.val_step(batch, cond, kwargs)
+                if self.val_data is not None:
+                    self.val_step()
+                else:
+                    batch, cond, kwargs = next(self.data)
+                    self.val_step_random_batch(batch, cond, kwargs)
             if self.step % self.save_interval == 0 and self.step > 0:
                 self.save()
                 # Run for a finite amount of time in integration tests.
@@ -208,7 +228,7 @@ class TrainLoop:
             self.optimize_normal()
         self.log_step()
 
-    def val_step(self, batch, cond, kwargs):
+    def val_step_random_batch(self, batch, cond, kwargs):
         self.model.eval()
         self.model_compression.eval()
 
@@ -239,6 +259,175 @@ class TrainLoop:
             plt.imsave(os.path.join(self.log_dir, '%d_LR.png'%i), cond[i])
             plt.imsave(os.path.join(self.log_dir, '%d_SR.png'%i), sample[i])
             plt.imsave(os.path.join(self.log_dir, '%d_HR.png'%i), batch[i])
+
+    def _build_lpips_metric(self):
+        if self.val_disable_lpips or self.val_lpips is not None:
+            return
+        try:
+            import lpips
+
+            self.val_lpips = lpips.LPIPS(net="vgg").to(dist_util.dev())
+            self.val_lpips.eval()
+            logger.log("validation LPIPS enabled.")
+        except Exception as e:
+            self.val_lpips = None
+            logger.log(f"validation LPIPS disabled due to init error: {e}")
+
+    @staticmethod
+    def _to_uint8_nhwc(tensor):
+        arr = ((tensor + 1.0) * 127.5).clamp(0, 255).to(th.uint8)
+        arr = arr.permute(0, 2, 3, 1).contiguous().cpu().numpy()
+        return arr
+
+    def _append_val_metrics_csv(self, step, n_samples, psnr_mean, ssim_mean, lpips_mean, elapsed_sec):
+        need_header = not os.path.exists(self.val_metrics_csv)
+        with open(self.val_metrics_csv, "a", newline="") as f:
+            writer = csv.writer(f)
+            if need_header:
+                writer.writerow(
+                    ["timestamp", "step", "num_samples", "psnr_mean", "ssim_mean", "lpips_mean", "elapsed_sec"]
+                )
+            writer.writerow(
+                [
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    int(step),
+                    int(n_samples),
+                    float(psnr_mean),
+                    float(ssim_mean),
+                    (float(lpips_mean) if lpips_mean is not None else ""),
+                    float(elapsed_sec),
+                ]
+            )
+
+    def val_step(self):
+        self.model.eval()
+        self.model_compression.eval()
+        self._build_lpips_metric()
+
+        max_samples = self.val_num_samples if self.val_num_samples > 0 else None
+        total_psnr = 0.0
+        total_ssim = 0.0
+        total_lpips = 0.0
+        total_count = 0
+        t0 = time.time()
+
+        if tqdm is not None:
+            progress_total = None
+            try:
+                full_batches = len(self.val_data)
+            except Exception:
+                full_batches = None
+
+            if max_samples is not None:
+                bs = getattr(self.val_data, "batch_size", None)
+                if bs is not None and bs > 0:
+                    progress_total = int(np.ceil(max_samples / float(bs)))
+                    if full_batches is not None:
+                        progress_total = min(progress_total, full_batches)
+                else:
+                    progress_total = full_batches
+            else:
+                progress_total = full_batches
+
+            val_iter = tqdm(
+                self.val_data,
+                total=progress_total,
+                desc=f"[val] step {self.step + self.resume_step}",
+                leave=False,
+            )
+        else:
+            val_iter = self.val_data
+
+        with th.no_grad():
+            for item in val_iter:
+                if len(item) < 3:
+                    raise ValueError("Validation loader must return (target, input, kwargs).")
+
+                batch, cond, kwargs = item[0], item[1], item[2]
+
+                if max_samples is not None:
+                    remain = max_samples - total_count
+                    if remain <= 0:
+                        break
+                    if batch.shape[0] > remain:
+                        batch = batch[:remain]
+                        cond = cond[:remain]
+                        if isinstance(kwargs, dict):
+                            kwargs = {k: v[:remain] for k, v in kwargs.items()}
+
+                batch = batch.to(dist_util.dev())
+                cond = cond.to(dist_util.dev())
+                if isinstance(kwargs, dict):
+                    kwargs = {k: v.to(dist_util.dev()) for k, v in kwargs.items()}
+                else:
+                    kwargs = {}
+
+                cond_comp = self.model_compression(cond)
+                sample = self.diffusion.p_sample_loop(
+                    self.model,
+                    cond_comp,
+                    (batch.shape[0], 3, batch.shape[-2], batch.shape[-1]),
+                    model_kwargs=kwargs,
+                )
+
+                pred_u8 = self._to_uint8_nhwc(sample)
+                gt_u8 = self._to_uint8_nhwc(batch)
+
+                for i in range(pred_u8.shape[0]):
+                    psnr = compare_psnr(gt_u8[i], pred_u8[i], data_range=255)
+                    ssim = (
+                        compare_ssim(gt_u8[i][:, :, 0], pred_u8[i][:, :, 0], data_range=255)
+                        + compare_ssim(gt_u8[i][:, :, 1], pred_u8[i][:, :, 1], data_range=255)
+                        + compare_ssim(gt_u8[i][:, :, 2], pred_u8[i][:, :, 2], data_range=255)
+                    ) / 3.0
+                    total_psnr += psnr
+                    total_ssim += ssim
+
+                if self.val_lpips is not None:
+                    lpips_scores = self.val_lpips(sample, batch).view(-1).detach().cpu().numpy()
+                    total_lpips += float(lpips_scores.sum())
+
+                total_count += pred_u8.shape[0]
+                if tqdm is not None:
+                    val_iter.set_postfix(
+                        samples=total_count,
+                        psnr=f"{(total_psnr / total_count):.3f}",
+                        ssim=f"{(total_ssim / total_count):.3f}",
+                    )
+
+        elapsed = time.time() - t0
+        self.model.train()
+        self.model_compression.train()
+
+        if total_count == 0:
+            logger.log("validation skipped: no samples evaluated.")
+            return
+
+        psnr_mean = total_psnr / total_count
+        ssim_mean = total_ssim / total_count
+        lpips_mean = (total_lpips / total_count) if self.val_lpips is not None else None
+
+        logger.logkv("val_psnr", psnr_mean)
+        logger.logkv("val_ssim", ssim_mean)
+        if lpips_mean is not None:
+            logger.logkv("val_lpips", lpips_mean)
+        logger.logkv("val_samples", total_count)
+        logger.logkv("val_time_sec", elapsed)
+        logger.dumpkvs()
+
+        self._append_val_metrics_csv(
+            step=self.step + self.resume_step,
+            n_samples=total_count,
+            psnr_mean=psnr_mean,
+            ssim_mean=ssim_mean,
+            lpips_mean=lpips_mean,
+            elapsed_sec=elapsed,
+        )
+        logger.log(
+            f"validation done @ step {self.step + self.resume_step}: "
+            f"samples={total_count}, PSNR={psnr_mean:.4f}, SSIM={ssim_mean:.4f}, "
+            f"LPIPS={lpips_mean if lpips_mean is not None else 'N/A'}"
+        )
 
     def forward_backward(self, batch, cond, kwargs):
         zero_grad(self.model_params)

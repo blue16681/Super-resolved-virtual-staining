@@ -208,6 +208,51 @@ def load_paired_npy_data(
     while True:
         yield from loader
 
+
+def load_paired_eval_data(
+    *,
+    input_dir,
+    target_dir,
+    batch_size,
+    image_size,
+    class_cond=False,
+    crop_mode="center",
+    num_workers=2,
+):
+    """
+    Create a deterministic paired image loader for validation/testing.
+    This loader does not use random crop or random augmentation.
+    """
+    if not input_dir:
+        raise ValueError("unspecified input_dir")
+    if not target_dir:
+        raise ValueError("unspecified target_dir")
+
+    classes = None
+    if class_cond:
+        target_files = sorted(
+            [p for p in glob.glob(os.path.join(target_dir, "*")) if os.path.isfile(p)]
+        )
+        class_names = [bf.basename(path).split("_")[0] for path in target_files]
+        sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
+        classes = [sorted_classes[x] for x in class_names]
+
+    dataset = PairedImageEvalDataset(
+        image_size,
+        input_dir=input_dir,
+        target_dir=target_dir,
+        classes=classes,
+        crop_mode=crop_mode,
+    )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+    )
+
 class PairedMATDataset_test(Dataset):
     def __init__(self, resolution, input_images, target_images, classes=None, shard=0, num_shards=1):
         super().__init__()
@@ -361,8 +406,8 @@ class PairedImageDataset(Dataset):
         while np.mean(tag_copy) * 255 >= 230:
             h, w = inp.shape[:2]
 
-            crop_y = np.random.randint(0, h - self.resolution)
-            crop_x = np.random.randint(0, w - self.resolution)
+            crop_y = np.random.randint(0, h - self.resolution + 1)
+            crop_x = np.random.randint(0, w - self.resolution + 1)
 
             tag_copy = tag[crop_y:crop_y+self.resolution,
                            crop_x:crop_x+self.resolution].copy()
@@ -394,6 +439,77 @@ class PairedImageDataset(Dataset):
         if self.local_classes is not None:
             out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
         return tag_copy, inp, out_dict
+
+
+class PairedImageEvalDataset(Dataset):
+    def __init__(self, resolution, input_dir, target_dir, classes=None, crop_mode="center"):
+        super().__init__()
+        self.resolution = resolution
+        self.crop_mode = crop_mode
+
+        input_files = sorted(
+            [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+        )
+        target_files = sorted(
+            [f for f in os.listdir(target_dir) if os.path.isfile(os.path.join(target_dir, f))]
+        )
+
+        self.common_fnames = sorted(list(set(input_files) & set(target_files)))
+        self.input_paths = [os.path.join(input_dir, f) for f in self.common_fnames]
+        self.target_paths = [os.path.join(target_dir, f) for f in self.common_fnames]
+        self.local_classes = classes
+
+        if len(self.common_fnames) == 0:
+            raise ValueError(
+                f"No paired files found between {input_dir} and {target_dir}"
+            )
+
+    def __len__(self):
+        return len(self.common_fnames)
+
+    def _deterministic_crop_pair(self, inp, tag):
+        h, w = inp.shape[:2]
+        if h < self.resolution or w < self.resolution:
+            raise ValueError(
+                f"Image too small for crop: {(h, w)} < {self.resolution}"
+            )
+
+        if h == self.resolution and w == self.resolution:
+            return inp, tag
+
+        if self.crop_mode == "center":
+            y0 = (h - self.resolution) // 2
+            x0 = (w - self.resolution) // 2
+        elif self.crop_mode == "top_left":
+            y0, x0 = 0, 0
+        else:
+            raise ValueError(f"Unsupported crop_mode: {self.crop_mode}")
+
+        y1, x1 = y0 + self.resolution, x0 + self.resolution
+        return inp[y0:y1, x0:x1], tag[y0:y1, x0:x1]
+
+    def __getitem__(self, idx):
+        inp = np.array(Image.open(self.input_paths[idx]).convert("RGB"), dtype=np.float32)
+        tag = np.array(Image.open(self.target_paths[idx]).convert("RGB"), dtype=np.float32) / 255.0
+
+        if inp.shape[:2] != tag.shape[:2]:
+            raise ValueError(
+                f"Shape mismatch for {self.common_fnames[idx]}: "
+                f"HE {inp.shape[:2]} vs IHC {tag.shape[:2]}"
+            )
+
+        inp, tag = self._deterministic_crop_pair(inp, tag)
+
+        inp = (inp - inp.mean()) / (inp.std() + 1e-6)
+        tag = tag.astype(np.float32) * 255 / 127.5 - 1
+
+        inp = inp.transpose(2, 0, 1)
+        tag = tag.transpose(2, 0, 1)
+
+        out_dict = {}
+        if self.local_classes is not None:
+            out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
+        return tag, inp, out_dict
 
 def pixel_binning(input_array, binning_factor=4):
     """

@@ -13,7 +13,7 @@ import torch as torch
 import torch.nn.functional as F
 
 from improved_diffusion import dist_util, logger
-from improved_diffusion.image_datasets import load_paired_npy_data
+from improved_diffusion.image_datasets import load_paired_npy_data, load_paired_eval_data
 from improved_diffusion.resample import create_named_schedule_sampler
 from improved_diffusion.script_util import (
     sr_model_and_diffusion_defaults,
@@ -59,6 +59,27 @@ def main():
         class_cond=args.class_cond,
     )
 
+    val_data = None
+    if args.val_lr_data_dir and args.val_hr_data_dir:
+        logger.log("creating validation data loader...")
+        val_data = load_pair_superres_eval_data(
+            args.val_hr_data_dir,
+            args.val_lr_data_dir,
+            args.val_batch_size,
+            large_size=args.large_size,
+            class_cond=args.class_cond,
+            crop_mode=args.val_crop_mode,
+            num_workers=args.val_num_workers,
+        )
+        logger.log(
+            f"validation enabled: HE={args.val_lr_data_dir}, IHC={args.val_hr_data_dir}, "
+            f"batch_size={args.val_batch_size}"
+        )
+    else:
+        logger.log(
+            "validation loader disabled (set --val_lr_data_dir and --val_hr_data_dir to enable full-set validation)."
+        )
+
     # Train model
     logger.log("training...")
     TrainLoop(
@@ -66,6 +87,7 @@ def main():
         model_compressor=model_compressor,
         diffusion=diffusion,
         data=data,
+        val_data=val_data,
         batch_size=args.batch_size,
         microbatch=args.microbatch,
         lr=args.lr,
@@ -81,6 +103,9 @@ def main():
         schedule_sampler=schedule_sampler,
         weight_decay=args.weight_decay,
         lr_anneal_steps=args.lr_anneal_steps,
+        val_num_samples=args.val_num_samples,
+        val_metrics_csv=args.val_metrics_csv,
+        val_disable_lpips=args.val_disable_lpips,
     ).run_loop()
 
 
@@ -95,27 +120,55 @@ def load_pair_superres_data(hr_data_dir, lr_data_dir, batch_size, large_size, sm
     )
     for large_batch, small_batch, model_kwargs in data:
         yield large_batch, small_batch, model_kwargs
+
+
+def load_pair_superres_eval_data(
+    hr_data_dir,
+    lr_data_dir,
+    batch_size,
+    large_size,
+    class_cond=False,
+    crop_mode="center",
+    num_workers=2,
+):
+    return load_paired_eval_data(
+        input_dir=lr_data_dir,
+        target_dir=hr_data_dir,
+        batch_size=batch_size,
+        image_size=large_size,
+        class_cond=class_cond,
+        crop_mode=crop_mode,
+        num_workers=num_workers,
+    )
         
 
 def create_argparser():
     defaults = dict(
-        lr_data_dir="dataset/BCI/train/HE", # training input data directory
-        hr_data_dir="dataset/BCI/train/IHC", # training target data directory
+        lr_data_dir="dataset/BCIdataset/HE", # training input data directory
+        hr_data_dir="dataset/BCIdataset/IHC", # training target data directory
         schedule_sampler="uniform",
         lr=1e-4, # learning rate
         weight_decay=0.0, # weight decay
         lr_anneal_steps=0, # learning rate anneal steps
-        batch_size=1, # batch size
+        batch_size=12, # batch size
         microbatch=-1, # microbatch size
         ema_rate="0.9999", 
         log_interval=10,
-        save_interval=20, #2000
-        val_interval=10,  #1000
+        save_interval=2000, #2000
+        val_interval=1000,  #1000
         resume_checkpoint="",
         model_dir="models",
         log_dir="log",
         use_fp16=False,
         fp16_scale_growth=1e-3,
+        val_lr_data_dir="", # validation/test input data directory (HE)
+        val_hr_data_dir="", # validation/test target data directory (IHC)
+        val_batch_size=1, # batch size for validation
+        val_num_workers=2, # dataloader workers for validation
+        val_num_samples=0, # 0 means evaluate full validation set
+        val_crop_mode="center", # deterministic crop mode for validation
+        val_metrics_csv="val_metrics.csv", # CSV filename under log_dir
+        val_disable_lpips=False, # set True to skip LPIPS during validation
     )
     datetime_str = datetime.now().strftime("%Y%m%d-%H%M")
     defaults['model_dir'] = os.path.join(defaults['model_dir'], 'BBDM-%s'%datetime_str)
